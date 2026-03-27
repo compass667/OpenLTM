@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from layers.Transformer_EncDec import TimerBlock, TimerLayer
 from layers.SelfAttention_Family import AttentionLayer, TimeAttention
+from layers.Embed import PositionalEmbedding
 
 
 class Model(nn.Module):
@@ -23,6 +24,7 @@ class Model(nn.Module):
         super().__init__()
         self.input_token_len = configs.input_token_len
         self.embedding = nn.Linear(self.input_token_len, configs.d_model)
+        self.position_embedding = PositionalEmbedding(configs.d_model)
         self.output_attention = configs.output_attention
         self.blocks = TimerBlock(
             [
@@ -41,7 +43,7 @@ class Model(nn.Module):
             ],
             norm_layer=torch.nn.LayerNorm(configs.d_model)
         )
-        self.head = nn.Linear(configs.d_model, configs.output_token_len)
+        self.head = nn.Linear(configs.d_model * 2, configs.output_token_len)
         self.use_norm = configs.use_norm
 
     def forecast(self, x, x_mark, y_mark):
@@ -63,6 +65,10 @@ class Model(nn.Module):
         # [B, C * N, D]
         embed_out = embed_out.reshape(B, C * N, -1)
         embed_out, attns = self.blocks(embed_out, n_vars=C, n_tokens=N)
+        next_pos = self.position_embedding(
+            torch.zeros(B * C, N + 1, self.input_token_len, device=x.device, dtype=x.dtype)
+        )[:, 1:, :].reshape(B, C * N, -1)
+        embed_out = torch.cat([embed_out, next_pos], dim=-1)
         # [B, C * N, P]
         dec_out = self.head(embed_out)
         # [B, C, N * P]

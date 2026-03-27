@@ -30,7 +30,8 @@ class Model(nn.Module):
                 DecoderOnlyLayer(
                     AttentionLayer(
                         FullAttention(True, attention_dropout=configs.dropout, 
-                                      output_attention=False), configs.d_model, configs.n_heads),
+                                      output_attention=False,
+                                      flash_attention=configs.flash_attention), configs.d_model, configs.n_heads),
                     configs.d_model,
                     configs.d_ff,
                     dropout=configs.dropout,
@@ -39,7 +40,7 @@ class Model(nn.Module):
             ],
             norm_layer=torch.nn.LayerNorm(configs.d_model)
         )
-        self.head = nn.Linear(configs.d_model, configs.output_token_len)
+        self.head = nn.Linear(configs.d_model * 2, configs.output_token_len)
         self.use_norm = configs.use_norm
 
     def forecast(self, x, x_mark, y_mark):
@@ -63,6 +64,10 @@ class Model(nn.Module):
         embed_out = self.embedding(x) + self.position_embedding(x)
         embed_out = self.dropout(embed_out)
         embed_out, attns = self.blocks(embed_out)
+        next_pos = self.position_embedding(
+            torch.zeros(B * C, N + 1, self.input_token_len, device=x.device, dtype=x.dtype)
+        )[:, 1:, :].expand(B * C, N, -1)
+        embed_out = torch.cat([embed_out, next_pos], dim=-1)
         # [B * C, N, P]
         dec_out = self.head(embed_out)
         # [B, C, L]

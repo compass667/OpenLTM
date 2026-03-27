@@ -46,7 +46,8 @@ if __name__ == '__main__':
     parser.add_argument('--test_file_name', type=str, default='checkpoint.pth', help='test file')
     parser.add_argument('--output_attention', action='store_true', help='output attention', default=False)
     parser.add_argument('--visualize', action='store_true', help='visualize', default=False)
-    parser.add_argument('--flash_attention', action='store_true', help='flash attention', default=False)
+    parser.add_argument('--flash_attention', dest='flash_attention', action='store_true', help='enable flash attention', default=True)
+    parser.add_argument('--no_flash_attention', dest='flash_attention', action='store_false', help='disable flash attention')
 
     # adaptation
     parser.add_argument('--adaptation', action='store_true', help='adaptation', default=False)
