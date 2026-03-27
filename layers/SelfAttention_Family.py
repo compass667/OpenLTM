@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import warnings
 from math import sqrt
 from einops import repeat
 from layers.Attn_Bias import BinaryAttentionBias
@@ -9,28 +10,59 @@ from utils.masking import TriangularCausalMask, TimerMultivariateMask, TimerCova
 
 
 class FullAttention(nn.Module):
-    def __init__(self, mask_flag=True, scale=None, attention_dropout=0.1, output_attention=False):
+    def __init__(self, mask_flag=True, scale=None, attention_dropout=0.1, output_attention=False, flash_attention=False):
         super(FullAttention, self).__init__()
         self.scale = scale
         self.mask_flag = mask_flag
         self.output_attention = output_attention
         self.dropout = nn.Dropout(attention_dropout)
+        self.flash_attention = flash_attention
+        self.attention_dropout = attention_dropout
+        self._flash_warning_emitted = False
 
     def forward(self, queries, keys, values, attn_mask, n_vars=None, n_tokens=None, tau=None, delta=None):
         B, L, H, E = queries.shape
         _, S, _, D = values.shape
         scale = self.scale or 1. / sqrt(E)
 
-        scores = torch.einsum("blhe,bshe->bhls", queries, keys)
+        A = None
+        use_flash_attention = self.flash_attention
+        if use_flash_attention:
+            flash_queries = queries.permute(0, 2, 1, 3)
+            flash_keys = keys.permute(0, 2, 1, 3)
+            flash_values = values.permute(0, 2, 1, 3)
+            flash_attn_mask = attn_mask
+            if self.mask_flag:
+                if flash_attn_mask is None:
+                    flash_attn_mask = TriangularCausalMask(B, L, device=queries.device)
+                flash_attn_mask = flash_attn_mask.mask
+            try:
+                V = torch.nn.functional.scaled_dot_product_attention(
+                    flash_queries,
+                    flash_keys,
+                    flash_values,
+                    attn_mask=flash_attn_mask,
+                    dropout_p=self.attention_dropout if self.training else 0.0,
+                    scale=scale,
+                ).permute(0, 2, 1, 3)
+            except RuntimeError as err:
+                use_flash_attention = False
+                self.flash_attention = False
+                if not self._flash_warning_emitted:
+                    warnings.warn(f"FullAttention flash attention failed, fallback to vanilla attention: {err}")
+                    self._flash_warning_emitted = True
 
-        if self.mask_flag:
-            if attn_mask is None:
-                attn_mask = TriangularCausalMask(B, L, device=queries.device)
+        if not use_flash_attention:
+            scores = torch.einsum("blhe,bshe->bhls", queries, keys)
 
-            scores.masked_fill_(attn_mask.mask, -np.inf)
+            if self.mask_flag:
+                if attn_mask is None:
+                    attn_mask = TriangularCausalMask(B, L, device=queries.device)
 
-        A = self.dropout(torch.softmax(scale * scores, dim=-1))
-        V = torch.einsum("bhls,bshd->blhd", A, values)
+                scores.masked_fill_(attn_mask.mask, -np.inf)
+
+            A = self.dropout(torch.softmax(scale * scores, dim=-1))
+            V = torch.einsum("bhls,bshd->blhd", A, values)
 
         if self.output_attention:
             return V.contiguous(), A
@@ -47,6 +79,7 @@ class TimeAttention(nn.Module):
         self.dropout = nn.Dropout(attention_dropout)
         self.covariate = covariate
         self.flash_attention = flash_attention
+        self._flash_warning_emitted = False
         self.qk_proj = QueryKeyProjection(dim=d_model, num_heads=num_heads, proj_layer=RotaryProjection, kwargs=dict(max_len=max_len),
                                           partial_factor=(0.0, 0.5),)
         self.attn_bias = BinaryAttentionBias(dim=d_model, num_heads=num_heads)
@@ -87,10 +120,25 @@ class TimeAttention(nn.Module):
         else:
             attn_mask = attn_bias
 
-        if self.flash_attention:
-            V = torch.nn.functional.scaled_dot_product_attention(
-                queries, keys, values, attn_mask)
-        else:
+        use_flash_attention = self.flash_attention
+        if use_flash_attention:
+            try:
+                V = torch.nn.functional.scaled_dot_product_attention(
+                    queries,
+                    keys,
+                    values,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    scale=scale,
+                ).permute(0, 2, 1, 3)
+            except RuntimeError as err:
+                use_flash_attention = False
+                self.flash_attention = False
+                if not self._flash_warning_emitted:
+                    warnings.warn(f"TimeAttention flash attention failed, fallback to vanilla attention: {err}")
+                    self._flash_warning_emitted = True
+
+        if not use_flash_attention:
             scores = torch.einsum("bhle,bhse->bhls", queries, keys)
             scores += attn_mask
             
@@ -139,4 +187,3 @@ class AttentionLayer(nn.Module):
         out = out.view(B, L, -1)
 
         return self.out_projection(out), attn
-
